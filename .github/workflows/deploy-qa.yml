@@ -1,0 +1,38 @@
+name: Deploy to QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Build version/tag to deploy'
+        required: false
+        default: 'latest'
+        type: string
+
+jobs:
+  deploy-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to QA Environment
+        run: |
+          echo "=========================================="
+          echo "🚀 Deploying to QA environment..."
+          echo "=========================================="
+          echo "Build Version: ${{ inputs.build_version }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+          sleep 3
+          echo "✅ QA deployment completed!"
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ QA Deployment Complete"
+          echo "=========================================="
+          echo "Version: ${{ inputs.build_version }}"
+          echo ""
+          echo "Next step: When QA approved, run 'Deploy to Prod' workflow"
