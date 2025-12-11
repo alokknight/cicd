@@ -1,0 +1,69 @@
+name: Notify QA Team
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Build version/tag to deploy'
+        required: false
+        default: 'latest'
+        type: string
+      build_notes:
+        description: 'Notes about this build (features, fixes, etc.)'
+        required: false
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  notify-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create QA Notification Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/deploy-qa.yml`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🧪 Build Ready for QA: ${{ inputs.build_version }}`,
+              body: `## New Build Ready for QA Testing
+
+            **Build Details:**
+            - Version: \`${{ inputs.build_version }}\`
+            - Commit: \`${{ github.sha }}\`
+            - Notified by: @${{ github.actor }}
+            - Date: ${new Date().toISOString()}
+
+            **Notes:**
+            ${{ inputs.build_notes || 'No additional notes provided.' }}
+
+            ---
+
+            ## 🚀 Deploy to QA
+
+            **[Click here to trigger QA deployment](${deployUrl})**
+
+            1. Click the link above
+            2. Click "Run workflow" button
+            3. Enter the build version: \`${{ inputs.build_version }}\`
+            4. Click "Run workflow"
+
+            ---
+
+            Close this issue after QA testing is complete.
+
+            /cc @alokknight
+            `,
+              labels: ['qa-ready']
+            });
+
+      - name: Summary
+        run: |
+          echo "✅ QA team has been notified!"
+          echo "Build version: ${{ inputs.build_version }}"
+          echo "Issue created with deployment link"
