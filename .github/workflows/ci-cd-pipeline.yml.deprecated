@@ -1,0 +1,668 @@
+name: Backend CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  pull_request:
+    branches:
+      - main
+      - staging
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment for deployment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+          - production
+      image_tag:
+        description: 'Image tag to deploy (leave empty to build new, or enter specific tag for rollback)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: read
+  id-token: write
+
+env:
+  # AWS Configuration
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  IMAGE_NAME: aicentral-backend
+  PYTHON_VERSION: '3.11'
+
+  # OIDC Roles (branch-based)
+  QA_OIDC_ARN: ${{ secrets.QA_OIDC_ARN }}
+  PRODUCTION_OIDC_ARN: ${{ secrets.PRODUCTION_OIDC_ARN }}
+
+  # SonarQube Configuration
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+  SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION || 'aicentralone' }}
+
+  # GitHub PAT for cross-repo triggers
+  PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+jobs:
+  # ============================================
+  # SECURITY SCANNING
+  # ============================================
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    if: github.event.inputs.image_tag == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install bandit safety
+
+      - name: Run Bandit (security linter)
+        run: bandit -r . -f json -o bandit-report.json
+        continue-on-error: true
+
+      - name: Run Safety (dependency vulnerability check)
+        run: safety check --json > safety-report.json
+        continue-on-error: true
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@75ba02d6183445fe0761d26e836bde58b1560600  # v1.1.0
+        with:
+          project: 'aicentral-backend'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --enableRetired
+            --enableExperimental
+        continue-on-error: true
+
+      - name: Upload OWASP report
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: owasp-report
+          path: reports/
+        if: always()
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # 0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+        continue-on-error: true
+
+  # ============================================
+  # SONARQUBE ANALYSIS
+  # ============================================
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    if: github.event.inputs.image_tag == ''
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov coverage
+
+      - name: Run tests with coverage
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: test_db
+          DB_USER: test
+          DB_PASSWORD: test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          coverage run --source=tenant_apps,public_apps --branch -m pytest tenant_apps/ public_apps/ -v
+          coverage xml -o coverage.xml
+          coverage report --show-missing
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@884b79409bbd464b2a59edc326a4b77dc56b2195  # v3.0.0
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=aicentralone_aiCentralBackEnd
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.sources=tenant_apps,public_apps
+            -Dsonar.tests=tenant_apps,public_apps
+            -Dsonar.test.inclusions=**/tests/**,**/test_*.py,**/*_test.py
+            -Dsonar.exclusions=**/migrations/**,**/__pycache__/**,**/tests/**
+
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b  # v1.2.0
+        timeout-minutes: 5
+
+  # ============================================
+  # UNIT TESTS
+  # ============================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    if: github.event.inputs.image_tag == ''
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-django pytest-asyncio
+
+      - name: Run unit tests
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: test_db
+          DB_USER: test
+          DB_PASSWORD: test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest tenant_apps/ public_apps/ -v --cov=. --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@7f8b4b4bde536c465e797be725718b88c5d95e0e  # v5.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+        if: always()
+
+      - name: Upload test results
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: unit-test-results
+          path: |
+            coverage.xml
+            htmlcov/
+        if: always()
+
+  # ============================================
+  # INTEGRATION TESTS
+  # ============================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    if: github.event.inputs.image_tag == ''
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-django pytest-asyncio
+
+      - name: Run integration tests
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: test_db
+          DB_USER: test
+          DB_PASSWORD: test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest tenant_apps/ public_apps/ -v --maxfail=5
+
+      - name: Upload test results
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: integration-test-results
+          path: pytest-report.xml
+        if: always()
+
+  # ============================================
+  # API TESTS (Contract Testing)
+  # ============================================
+  api-tests:
+    name: API Contract Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    if: github.event_name == 'pull_request' && github.event.inputs.image_tag == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest requests
+
+      - name: Run API contract tests
+        run: |
+          pytest tenant_apps/ public_apps/ -v --tb=short
+        continue-on-error: true
+
+  # ============================================
+  # BUILD & SCAN DOCKER IMAGE
+  # ============================================
+  build:
+    name: Build and Scan Docker Image
+    runs-on: ubuntu-latest
+    needs: [security-scan, sonarqube, unit-tests, integration-tests]
+    if: |
+      always() &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') &&
+      (needs.sonarqube.result == 'success' || needs.sonarqube.result == 'skipped') &&
+      (needs.unit-tests.result == 'success' || needs.unit-tests.result == 'skipped') &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      github.event.inputs.image_tag == '' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set build variables
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          if [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            IMAGE_TAG="staging-${SHORT_SHA}"
+          else
+            IMAGE_TAG="prod-${SHORT_SHA}"
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ github.ref == 'refs/heads/staging' && env.QA_OIDC_ARN || env.PRODUCTION_OIDC_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349  # v3.7.1
+
+      - name: Build Docker image (no push yet)
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VCS_REF=${{ steps.vars.outputs.short_sha }}
+
+      - name: Run Trivy vulnerability scanner on image
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # 0.28.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run Trivy vulnerability scanner (table output)
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # 0.28.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Generate SBOM (Software Bill of Materials)
+        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb  # v0.17.7
+        with:
+          image: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: sbom
+          path: sbom.json
+
+  # ============================================
+  # TRIGGER DEV DEPLOYMENT (staging branch - auto)
+  # ============================================
+  trigger-dev:
+    name: Trigger Dev Deployment
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.ref == 'refs/heads/staging' &&
+      github.event.inputs.image_tag == '' &&
+      needs.build.result == 'success'
+
+    steps:
+      - name: Trigger Terraform Dev Deploy
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ env.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aicentralone/Terraform/dispatches \
+            -d '{
+              "event_type": "dev-deploy-trigger",
+              "client_payload": {
+                "backend_image_tag": "${{ needs.build.outputs.image_tag }}",
+                "frontend_image_tag": "latest",
+                "frontend2_image_tag": "latest",
+                "target_env": "dev"
+              }
+            }'
+
+      - name: Dev deployment triggered
+        run: |
+          echo "=========================================="
+          echo "DEV DEPLOYMENT TRIGGERED (automatic)"
+          echo "=========================================="
+          echo "Backend Image Tag: ${{ needs.build.outputs.image_tag }}"
+          echo "Frontend Image Tag: latest"
+          echo "Frontend2 Image Tag: latest"
+          echo "=========================================="
+
+  # ============================================
+  # TRIGGER QA DEPLOYMENT (staging branch - approval required)
+  # ============================================
+  trigger-qa:
+    name: Trigger QA Deployment
+    needs: [build, trigger-dev]
+    runs-on: ubuntu-latest
+    environment: qa
+    if: |
+      github.ref == 'refs/heads/staging' &&
+      github.event.inputs.image_tag == '' &&
+      needs.build.result == 'success'
+
+    steps:
+      - name: Trigger Terraform QA Deploy
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ env.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aicentralone/Terraform/dispatches \
+            -d '{
+              "event_type": "qa-deploy-trigger",
+              "client_payload": {
+                "backend_image_tag": "${{ needs.build.outputs.image_tag }}",
+                "frontend_image_tag": "latest",
+                "frontend2_image_tag": "latest",
+                "target_env": "qa"
+              }
+            }'
+
+      - name: QA deployment triggered
+        run: |
+          echo "=========================================="
+          echo "QA DEPLOYMENT TRIGGERED (after approval)"
+          echo "=========================================="
+          echo "Backend Image Tag: ${{ needs.build.outputs.image_tag }}"
+          echo "Frontend Image Tag: latest"
+          echo "Frontend2 Image Tag: latest"
+          echo "=========================================="
+
+  # ============================================
+  # TRIGGER UAT DEPLOYMENT (main branch - approval required)
+  # ============================================
+  trigger-uat:
+    name: Trigger UAT Deployment
+    needs: build
+    runs-on: ubuntu-latest
+    environment: uat
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event.inputs.image_tag == '' &&
+      needs.build.result == 'success'
+
+    steps:
+      - name: Trigger Terraform UAT Deploy
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ env.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aicentralone/Terraform/dispatches \
+            -d '{
+              "event_type": "uat-deploy-trigger",
+              "client_payload": {
+                "backend_image_tag": "${{ needs.build.outputs.image_tag }}",
+                "frontend_image_tag": "latest",
+                "frontend2_image_tag": "latest"
+              }
+            }'
+
+      - name: UAT deployment triggered
+        run: |
+          echo "=========================================="
+          echo "UAT DEPLOYMENT TRIGGERED (after approval)"
+          echo "=========================================="
+          echo "Backend Image Tag: ${{ needs.build.outputs.image_tag }}"
+          echo "Frontend Image Tag: latest"
+          echo "Frontend2 Image Tag: latest"
+          echo "=========================================="
+
+  # ============================================
+  # TRIGGER PROD DEPLOYMENT (main branch - approval required)
+  # ============================================
+  trigger-prod:
+    name: Trigger Production Deployment
+    needs: [build, trigger-uat]
+    runs-on: ubuntu-latest
+    environment: production
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event.inputs.image_tag == '' &&
+      needs.build.result == 'success'
+
+    steps:
+      - name: Trigger Terraform Prod Deploy
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ env.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aicentralone/Terraform/dispatches \
+            -d '{
+              "event_type": "prod-deploy-trigger",
+              "client_payload": {
+                "backend_image_tag": "${{ needs.build.outputs.image_tag }}",
+                "frontend_image_tag": "latest",
+                "frontend2_image_tag": "latest"
+              }
+            }'
+
+      - name: Production deployment triggered
+        run: |
+          echo "=========================================="
+          echo "PRODUCTION DEPLOYMENT TRIGGERED"
+          echo "=========================================="
+          echo "Backend Image Tag: ${{ needs.build.outputs.image_tag }}"
+          echo "Frontend Image Tag: latest"
+          echo "Frontend2 Image Tag: latest"
+          echo "=========================================="
+
+  # ============================================
+  # MANUAL DEPLOY / ROLLBACK (workflow_dispatch with image_tag)
+  # ============================================
+  deploy-manual:
+    name: Manual Deploy / Rollback
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag != ''
+
+    steps:
+      - name: Determine event type
+        id: event
+        run: |
+          case "${{ github.event.inputs.environment }}" in
+            dev|qa) echo "event_type=qa-deploy-trigger" >> $GITHUB_OUTPUT ;;
+            uat)    echo "event_type=uat-deploy-trigger" >> $GITHUB_OUTPUT ;;
+            production) echo "event_type=prod-deploy-trigger" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Trigger Terraform Deploy (Rollback)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ env.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aicentralone/Terraform/dispatches \
+            -d '{
+              "event_type": "${{ steps.event.outputs.event_type }}",
+              "client_payload": {
+                "backend_image_tag": "${{ github.event.inputs.image_tag }}",
+                "frontend_image_tag": "latest",
+                "frontend2_image_tag": "latest",
+                "target_env": "${{ github.event.inputs.environment }}"
+              }
+            }'
+
+      - name: Manual deployment triggered
+        run: |
+          echo "=========================================="
+          echo "MANUAL DEPLOYMENT / ROLLBACK TRIGGERED"
+          echo "=========================================="
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Backend Image Tag: ${{ github.event.inputs.image_tag }}"
+          echo "Frontend Image Tag: latest"
+          echo "Frontend2 Image Tag: latest"
+          echo "=========================================="
