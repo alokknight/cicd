@@ -1,9 +1,17 @@
 name: Deploy to Dev
 
 on:
+  # Trigger when PR is merged into staging
   push:
     branches:
       - staging
+      - main
+  # Trigger when PR is opened/updated targeting staging
+  pull_request:
+    branches:
+      - staging
+      - main
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 jobs:
