@@ -1,0 +1,28 @@
+name: Deploy to Dev
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Dev Environment
+        run: |
+          echo "=========================================="
+          echo "🚀 Deploying to DEV environment..."
+          echo "=========================================="
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+          sleep 3
+          echo "✅ DEV deployment completed!"
+          echo ""
+          echo "📋 When ready for QA, go to:"
+          echo "   Actions → 'Promote to QA' → Run workflow"
