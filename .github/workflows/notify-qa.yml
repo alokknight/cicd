@@ -1,12 +1,15 @@
-name: Notify QA Team
+name: Request QA Story Testing
 
 on:
   workflow_dispatch:
     inputs:
-      build_version:
-        description: 'Build version/tag to deploy'
-        required: false
-        default: 'latest'
+      image_tag:
+        description: 'Staging image tag (e.g., staging-abc1234)'
+        required: true
+        type: string
+      stories:
+        description: 'Story/ticket numbers being tested (e.g., TICKET-123, TICKET-456)'
+        required: true
         type: string
       build_notes:
         description: 'Notes about this build (features, fixes, etc.)'
@@ -21,42 +24,75 @@ jobs:
   notify-qa:
     runs-on: ubuntu-latest
     steps:
-      - name: Create QA Notification Issue
+      - name: Validate inputs
+        run: |
+          if [[ ! "${{ inputs.image_tag }}" =~ ^staging- ]]; then
+            echo "Warning: Image tag doesn't start with 'staging-'. Expected staging image for story testing."
+          fi
+
+      - name: Create QA Story Testing Issue
         uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          STORIES: ${{ inputs.stories }}
+          BUILD_NOTES: ${{ inputs.build_notes }}
+          ACTOR: ${{ github.actor }}
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🧪 Build Ready for QA: ${{ inputs.build_version }}`,
-              body: `## New Build Ready for QA Testing
+            const imageTag = process.env.IMAGE_TAG;
+            const stories = process.env.STORIES;
+            const buildNotes = process.env.BUILD_NOTES || 'No additional notes provided.';
+            const actor = process.env.ACTOR;
+            const date = new Date().toISOString();
 
-            **Build Details:**
-            - Version: \`${{ inputs.build_version }}\`
-            - Commit: \`${{ github.sha }}\`
-            - Notified by: @${{ github.actor }}
-            - Date: ${new Date().toISOString()}
+            const body = `## Story Testing Request
+
+            **Image Tag:** \`${imageTag}\`
+            **Stories:** ${stories}
+            **Requested by:** @${actor}
+            **Date:** ${date}
 
             **Notes:**
-            ${{ inputs.build_notes || 'No additional notes provided.' }}
+            ${buildNotes}
 
             ---
 
-            ## ✅ How to Deploy to QA
+            ## Actions
 
-            **Comment \`deploy\` or \`approved\` on this issue to trigger QA deployment.**
+            | Command | Action |
+            |---------|--------|
+            | \`deploy\` | Deploy this image to QA environment |
+            | \`passed\` | Mark all stories as passed |
+            | \`failed\` | Mark testing as failed (with details) |
 
-            The deployment will start automatically and this issue will close.
+            ---
+
+            ## Testing Checklist
+
+            - [ ] Image deployed to QA
+            - [ ] Stories tested: ${stories}
+            - [ ] All acceptance criteria verified
+            - [ ] No blockers found
 
             ---
 
             /cc @alokknight
-            `,
-              labels: ['qa-ready']
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🧪 QA Story Testing: ${imageTag}`,
+              body: body,
+              labels: ['qa-story-testing']
             });
 
       - name: Summary
         run: |
-          echo "✅ QA team has been notified!"
-          echo "Build version: ${{ inputs.build_version }}"
+          echo "=========================================="
+          echo "QA Story Testing Request Created"
+          echo "=========================================="
+          echo "Image Tag: ${{ inputs.image_tag }}"
+          echo "Stories: ${{ inputs.stories }}"
           echo "QA can comment 'deploy' on the issue to trigger deployment"
+          echo "=========================================="

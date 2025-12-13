@@ -1,0 +1,163 @@
+name: Create Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.4.5)'
+        required: true
+        type: string
+      source_commit:
+        description: 'Commit SHA to cut from (leave empty for latest staging)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version format
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in format vX.Y.Z (e.g., v1.4.5)"
+            exit 1
+          fi
+          echo "Version format validated: ${{ inputs.version }}"
+
+      - name: Checkout staging
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Check if release branch already exists
+        run: |
+          if git ls-remote --heads origin release/${{ inputs.version }} | grep -q release/${{ inputs.version }}; then
+            echo "Error: Release branch release/${{ inputs.version }} already exists"
+            exit 1
+          fi
+          echo "Release branch does not exist, proceeding..."
+
+      - name: Create release branch
+        id: create_branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Determine commit to cut from
+          if [ -n "${{ inputs.source_commit }}" ]; then
+            COMMIT="${{ inputs.source_commit }}"
+            echo "Using specified commit: $COMMIT"
+          else
+            COMMIT=$(git rev-parse HEAD)
+            echo "Using latest staging commit: $COMMIT"
+          fi
+
+          BRANCH="release/${{ inputs.version }}"
+
+          # Create and push the release branch
+          git checkout $COMMIT
+          git checkout -b $BRANCH
+          git push origin $BRANCH
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "short_sha=$(git rev-parse --short $COMMIT)" >> $GITHUB_OUTPUT
+
+          echo "=========================================="
+          echo "Created branch: $BRANCH"
+          echo "From commit: $COMMIT"
+          echo "=========================================="
+
+      - name: Create Release Tracking Issue
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ steps.create_branch.outputs.branch }}
+          COMMIT: ${{ steps.create_branch.outputs.commit }}
+          SHORT_SHA: ${{ steps.create_branch.outputs.short_sha }}
+          ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const version = process.env.VERSION;
+            const branch = process.env.BRANCH;
+            const commit = process.env.COMMIT;
+            const shortSha = process.env.SHORT_SHA;
+            const actor = process.env.ACTOR;
+            const date = new Date().toISOString();
+
+            const body = `## Release ${version}
+
+            **Branch:** \`${branch}\`
+            **Cut from:** \`${commit}\`
+            **Created by:** @${actor}
+            **Date:** ${date}
+
+            ---
+
+            ## Checklist
+
+            - [x] Release branch created
+            - [ ] Image built (waiting for CI: \`${version}-${shortSha}\`)
+            - [ ] QA Regression passed
+            - [ ] UAT passed
+            - [ ] PROD deployed
+            - [ ] 1-day monitoring complete
+            - [ ] Merged to main
+            - [ ] Tagged on main
+            - [ ] Release branch deleted
+
+            ---
+
+            ## Commands
+
+            | Command | Action |
+            |---------|--------|
+            | \`deploy\` | Deploy release image to QA (regression testing) |
+            | \`/promote-uat\` | Deploy to UAT (all repos coordinated) |
+            | \`/promote-prod\` | Deploy to PROD (all repos coordinated) |
+
+            ---
+
+            ## Image Tags
+
+            | Service | Image Tag |
+            |---------|-----------|
+            | Backend | \`${version}-${shortSha}\` (pending build) |
+            | Frontend | (to be updated) |
+            | Community | (to be updated) |
+
+            ---
+
+            ## Notes
+            - CI pipeline will automatically build the image when the release branch is pushed
+            - Once QA regression passes, use \`/promote-uat\` to deploy all services to UAT
+            - After UAT approval, use \`/promote-prod\` for production deployment
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Release ${version}`,
+              body: body,
+              labels: ['release', 'qa-regression']
+            });
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "Release Branch Created Successfully"
+          echo "=========================================="
+          echo "Branch: release/${{ inputs.version }}"
+          echo "Commit: ${{ steps.create_branch.outputs.commit }}"
+          echo ""
+          echo "Next Steps:"
+          echo "1. CI will automatically build image: ${{ inputs.version }}-${{ steps.create_branch.outputs.short_sha }}"
+          echo "2. Once built, comment 'deploy' on the release issue to deploy to QA"
+          echo "3. After QA regression passes, use /promote-uat to deploy to UAT"
+          echo "=========================================="

@@ -1,0 +1,103 @@
+name: Request Production Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'UAT-approved image tag to deploy to Production'
+        required: true
+        type: string
+      uat_issue_number:
+        description: 'UAT approval issue number (for reference)'
+        required: false
+        type: string
+      release_version:
+        description: 'Release version (e.g., v1.2.3)'
+        required: false
+        type: string
+      release_notes:
+        description: 'Production release notes'
+        required: false
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  notify-prod:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Production Deployment Request Issue
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          UAT_ISSUE: ${{ inputs.uat_issue_number }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const imageTag = process.env.IMAGE_TAG;
+            const uatIssue = process.env.UAT_ISSUE;
+            const releaseVersion = process.env.RELEASE_VERSION || imageTag;
+            const releaseNotes = process.env.RELEASE_NOTES || 'No release notes provided.';
+            const actor = process.env.ACTOR;
+            const date = new Date().toISOString();
+
+            const uatReference = uatIssue ? `**UAT Issue:** #${uatIssue}` : '';
+
+            const body = `## 🚨 Production Deployment Request
+
+            **Image Tag:** \`${imageTag}\`
+            **Release Version:** \`${releaseVersion}\`
+            **Requested by:** @${actor}
+            **Date:** ${date}
+            ${uatReference}
+
+            **Release Notes:**
+            ${releaseNotes}
+
+            ---
+
+            ## ⚠️ Production Deployment Actions
+
+            | Command | Action |
+            |---------|--------|
+            | \`deploy\` | **DEPLOY TO PRODUCTION** |
+            | \`rejected\` | Reject this release |
+
+            ---
+
+            ## Pre-Deployment Checklist
+
+            - [ ] UAT sign-off received
+            - [ ] Release notes reviewed
+            - [ ] Rollback plan confirmed
+            - [ ] Stakeholders notified
+            - [ ] Deployment window confirmed
+
+            ---
+
+            ⚠️ **This will deploy to PRODUCTION. Please verify all checks before commenting \`deploy\`.**
+
+            /cc @alokknight
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 PROD Deployment: ${releaseVersion} (${imageTag})`,
+              body: body,
+              labels: ['prod-deployment', 'requires-approval']
+            });
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "Production Deployment Request Created"
+          echo "=========================================="
+          echo "Image Tag: ${{ inputs.image_tag }}"
+          echo "Release: ${{ inputs.release_version }}"
+          echo "Approvers can comment 'deploy' to trigger Production deployment"
+          echo "=========================================="
