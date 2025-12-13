@@ -1,0 +1,93 @@
+name: Request UAT Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'QA-approved image tag to deploy to UAT'
+        required: true
+        type: string
+      qa_issue_number:
+        description: 'QA testing issue number (for reference)'
+        required: false
+        type: string
+      release_notes:
+        description: 'Release notes / changes included'
+        required: false
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  notify-uat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create UAT Deployment Request Issue
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          QA_ISSUE: ${{ inputs.qa_issue_number }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const imageTag = process.env.IMAGE_TAG;
+            const qaIssue = process.env.QA_ISSUE;
+            const releaseNotes = process.env.RELEASE_NOTES || 'No release notes provided.';
+            const actor = process.env.ACTOR;
+            const date = new Date().toISOString();
+
+            const qaReference = qaIssue ? `**QA Issue:** #${qaIssue}` : '';
+
+            const body = `## UAT Deployment Request
+
+            **Image Tag:** \`${imageTag}\`
+            **Requested by:** @${actor}
+            **Date:** ${date}
+            ${qaReference}
+
+            **Release Notes:**
+            ${releaseNotes}
+
+            ---
+
+            ## Actions
+
+            | Command | Action |
+            |---------|--------|
+            | \`deploy\` | Deploy this image to UAT environment |
+            | \`approved\` | Approve for Production deployment |
+            | \`rejected\` | Reject this release |
+
+            ---
+
+            ## UAT Checklist
+
+            - [ ] Image deployed to UAT
+            - [ ] Smoke tests passed
+            - [ ] Business acceptance verified
+            - [ ] Ready for Production
+
+            ---
+
+            /cc @alokknight
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚀 UAT Deployment: ${imageTag}`,
+              body: body,
+              labels: ['uat-deployment']
+            });
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "UAT Deployment Request Created"
+          echo "=========================================="
+          echo "Image Tag: ${{ inputs.image_tag }}"
+          echo "Stakeholders can comment 'deploy' to trigger UAT deployment"
+          echo "=========================================="
